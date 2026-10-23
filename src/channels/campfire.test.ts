@@ -162,10 +162,21 @@ describe('helpers', () => {
 const MENTION_HTML =
   '<div><action-text-attachment sgid="abc" content-type="application/vnd.campfire.mention">Bot</action-text-attachment> hi</div>';
 
-function webhookPayload(opts: { user?: number; room?: number; plain?: string; html?: string; name?: string }) {
+function webhookPayload(opts: {
+  user?: number;
+  room?: number;
+  plain?: string;
+  html?: string;
+  name?: string;
+  roomName?: string | null;
+}) {
   return JSON.stringify({
     user: { id: opts.user ?? 7, name: opts.name ?? 'Alice' },
-    room: { id: opts.room ?? 9, name: 'Room', path: '/rooms/9/2-key/messages' },
+    room: {
+      id: opts.room ?? 9,
+      name: opts.roomName === undefined ? 'Room' : opts.roomName,
+      path: '/rooms/9/2-key/messages',
+    },
     message: {
       id: 500,
       body: { html: opts.html ?? `<div>${opts.plain ?? 'hi'}</div>`, plain: opts.plain ?? 'hi' },
@@ -356,6 +367,12 @@ describe('group vs DM detection', () => {
     await h.send({ room: 31 });
     expect(await h.adapter.resolveChannelName!('campfire:31')).toBe('Room');
     expect(await h.adapter.resolveChannelName!('campfire:32')).toBeNull();
+  });
+
+  it('names unnamed direct rooms after the other person', async () => {
+    const h = await startAdapter('campfire-dmname');
+    await h.send({ room: 33, roomName: null, name: 'Alice' });
+    expect(await h.adapter.resolveChannelName!('campfire:33')).toBe('DM with Alice');
   });
 });
 
@@ -593,6 +610,15 @@ describe('question reply interception', () => {
     expect(h.actions[0]).toMatchObject({ value: 'reject' });
   });
 
+  it('answers with a leading number and forwards the rest as chat', async () => {
+    const h = await startAdapter('campfire-icpt5');
+    await h.adapter.deliver('campfire:9', null, { kind: 'chat-sdk', content: ASK });
+    await h.send({ user: 7, room: 9, plain: '2) not today' });
+    expect(h.actions).toMatchObject([{ questionId: 'q-1', value: 'reject' }]);
+    await vi.waitFor(() => expect(h.inbound).toHaveLength(1));
+    expect(h.inbound[0].message.content).toMatchObject({ text: 'not today', senderId: 'campfire:7' });
+  });
+
   it('only intercepts in the room that holds the question', async () => {
     const h = await startAdapter('campfire-icpt4');
     await h.adapter.deliver('campfire:9', null, { kind: 'chat-sdk', content: ASK });
@@ -663,10 +689,15 @@ describe('text helpers', () => {
       { label: 'Allow', selectedLabel: 'Allow', value: 'a' },
       { label: 'Deny', selectedLabel: 'Deny', value: 'd' },
     ];
-    expect(matchOption(opts, '2')?.value).toBe('d');
-    expect(matchOption(opts, '1.')?.value).toBe('a');
-    expect(matchOption(opts, ' DENY ')?.value).toBe('d');
+    expect(matchOption(opts, '2')).toMatchObject({ option: { value: 'd' }, rest: '' });
+    expect(matchOption(opts, '1.')).toMatchObject({ option: { value: 'a' }, rest: '' });
+    expect(matchOption(opts, ' DENY ')).toMatchObject({ option: { value: 'd' }, rest: '' });
+    expect(matchOption(opts, '1. Allow')).toMatchObject({ option: { value: 'a' }, rest: '' });
+    expect(matchOption(opts, '2) because reasons')).toMatchObject({ option: { value: 'd' }, rest: 'because reasons' });
+    expect(matchOption(opts, '2 later')).toMatchObject({ option: { value: 'd' }, rest: 'later' });
     expect(matchOption(opts, '3')).toBeNull();
+    expect(matchOption(opts, '3 Allow')).toBeNull();
+    expect(matchOption(opts, '12abc')).toBeNull();
     expect(matchOption(opts, 'allow it please')).toBeNull();
   });
 

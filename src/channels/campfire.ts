@@ -87,7 +87,7 @@ export interface CampfireConfig {
 /** The subset of Campfire's webhook payload (app/models/webhook.rb) this adapter uses. */
 export interface CampfireWebhookPayload {
   user: { id: number; name: string };
-  room: { id: number; name: string; path: string };
+  room: { id: number; name: string | null; path: string };
   message: { id: number; body: { html: string; plain: string }; path: string };
 }
 
@@ -360,12 +360,27 @@ function writeJsonFile(file: string, data: unknown): void {
 }
 
 /** The option a reply picks: its 1-based number, or its label, case-insensitively. */
-export function matchOption(options: NormalizedOption[], reply: string): NormalizedOption | null {
+/**
+ * The option a reply picks: a leading option number ("2", "2.", "2) Ok",
+ * "3 Brewers") or the exact label. `rest` is text after the number that isn't
+ * just the label repeated. It reaches the agent as chat, the way typing after
+ * tapping "Other" does on platforms with buttons.
+ */
+export function matchOption(
+  options: NormalizedOption[],
+  reply: string,
+): { option: NormalizedOption; rest: string } | null {
   const text = reply.trim();
-  const num = text.match(/^(\d{1,3})[.)]?$/);
-  if (num) return options[Number(num[1]) - 1] ?? null;
+  const num = text.match(/^(\d{1,3})(?:[.):]|(?=\s)|$)\s*([\s\S]*)$/);
+  if (num) {
+    const option = options[Number(num[1]) - 1];
+    if (!option) return null;
+    const rest = num[2].trim();
+    return { option, rest: rest.toLowerCase() === option.label.toLowerCase() ? '' : rest };
+  }
   const lower = text.toLowerCase();
-  return options.find((o) => o.label.toLowerCase() === lower) ?? null;
+  const option = options.find((o) => o.label.toLowerCase() === lower);
+  return option ? { option, rest: '' } : null;
 }
 
 /** Title, question and resolution of a settled card, as Markdown. */
@@ -497,11 +512,13 @@ export function createCampfireAdapter(cfg: CampfireConfig): ChannelAdapter {
     platformId: string,
     roomId: string,
     payload: CampfireWebhookPayload,
+    isGroup: boolean,
   ): Promise<boolean> {
     const question = pending.get(platformId);
     if (!question) return false;
-    const option = matchOption(question.options, payload.message.body.plain);
-    if (!option) return false;
+    const match = matchOption(question.options, payload.message.body.plain);
+    if (!match) return false;
+    const { option, rest } = match;
 
     // Look up render metadata BEFORE onAction, which may delete the row.
     const render = await (async () => resolveRender(question.questionId))().catch(() => undefined);
@@ -525,6 +542,10 @@ export function createCampfireAdapter(cfg: CampfireConfig): ChannelAdapter {
       } catch (err) {
         log.warn('Campfire: failed to update question card after reply', { err, platformId });
       }
+    }
+    if (rest) {
+      const followUp = { ...payload, message: { ...payload.message, body: { ...payload.message.body, plain: rest } } };
+      await config.onInbound(platformId, null, toInboundMessage(followUp, new Date(), isGroup));
     }
     return true;
   }
@@ -570,10 +591,12 @@ export function createCampfireAdapter(cfg: CampfireConfig): ChannelAdapter {
       dmRoomByUser.set(String(payload.user.id), roomId);
       persistDms();
     }
-    roomNames.set(roomId, payload.room.name);
-    config.onMetadata(platformId, payload.room.name, isGroup);
+    // Direct rooms have no name in Campfire.
+    const roomName = payload.room.name || (isGroup ? '' : `DM with ${payload.user.name}`);
+    if (roomName) roomNames.set(roomId, roomName);
+    config.onMetadata(platformId, roomName || undefined, isGroup);
     try {
-      if (await interceptReply(config, platformId, roomId, payload)) return;
+      if (await interceptReply(config, platformId, roomId, payload, isGroup)) return;
       await config.onInbound(platformId, null, toInboundMessage(payload, new Date(), isGroup));
     } catch (err) {
       log.error('Campfire: onInbound threw', { err, platformId });
